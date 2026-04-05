@@ -1,0 +1,171 @@
+name: Test Build
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+    paths-ignore:
+      - '**.md'
+
+jobs:
+  build:
+    name: Test ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm_cortex-a9_vfpv3-d16
+            target: mvebu-cortexa9
+          - arch: mips_24kc
+            target: ath79-generic
+          - arch: mipsel_24kc
+            target: mt7621
+          - arch: aarch64_cortex-a53
+            target: mvebu-cortexa53
+          - arch: arm_cortex-a15_neon-vfpv4
+            target: armvirt-32
+          - arch: i386_pentium-mmx
+            target: x86-geode
+          - arch: x86_64
+            target: x86-64
+
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine branch name
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            BRANCH="${GITHUB_BASE_REF}"
+          else
+            BRANCH="${GITHUB_REF_NAME}"
+          fi
+          echo "Building for $BRANCH"
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+
+      - name: Determine changed packages
+        run: |
+          # 查找所有包含 Makefile 的目录（排除 src 内部的）
+          PKG_ROOTS=$(find . -name Makefile | grep -v ".*/src/Makefile" | sed -e 's@./\(.*\)/Makefile@\1/@')
+          
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            BASE_REF="origin/${BRANCH}"
+          else
+            # 如果是 Push，对比上一个 commit
+            BASE_REF="HEAD^"
+          fi
+          
+          # 获取变更文件列表
+          CHANGES=$(git diff --diff-filter=d --name-only $BASE_REF HEAD || echo "")
+
+          PACKAGES=""
+          for ROOT in $PKG_ROOTS; do
+            for CHANGE in $CHANGES; do
+              if [[ "$CHANGE" == "$ROOT"* ]]; then
+                PACKAGE_NAME=$(echo "$ROOT" | sed -e 's@\(.*\)/@\1@')
+                PACKAGES="$PACKAGES $PACKAGE_NAME"
+                break
+              fi
+            done
+          done
+          
+          # 如果没有检测到变更，默认编译 luci-app-ssr-plus (可根据需要修改)
+          PACKAGES="${PACKAGES:-luci-app-ssr-plus}"
+          # 去除多余空格
+          PACKAGES=$(echo $PACKAGES | xargs)
+
+          echo "Detected packages: $PACKAGES"
+          echo "PACKAGES=$PACKAGES" >> $GITHUB_ENV
+
+      - name: Build
+        uses: immortalwrt/gh-action-sdk@v7
+        env:
+          ARCH: ${{ matrix.arch }}
+          FEEDNAME: packages_ci
+          V: s
+          target: ${{ matrix.target }}
+          packages: ${{ env.PACKAGES }}
+
+      - name: Move created packages to project dir
+        run: |
+          mkdir -p ./output
+          cp bin/packages/${{ matrix.arch }}/packages_ci/*.ipk ./output/ 2>/dev/null || true
+          cp bin/targets/${{ matrix.target }}/*/*.ipk ./output/ 2>/dev/null || true
+
+      - name: Collect metadata
+        run: |
+          MERGE_ID=$(git rev-parse --short HEAD)
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            BASE_ID=$(git rev-parse --short origin/$BRANCH)
+            HEAD_ID=$(git rev-parse --short HEAD)
+            PRNUMBER="PR-${{ github.event.pull_request.number }}"
+          else
+            BASE_ID=$(git rev-parse --short HEAD^)
+            HEAD_ID=$MERGE_ID
+            PRNUMBER="push-$MERGE_ID"
+          fi
+          
+          echo "ARCHIVE_NAME=${{ matrix.arch }}-$PRNUMBER" >> $GITHUB_ENV
+          echo "HEAD_ID=$HEAD_ID" >> $GITHUB_ENV
+          echo "BASE_ID=$BASE_ID" >> $GITHUB_ENV
+          echo "PRNUMBER=$PRNUMBER" >> $GITHUB_ENV
+
+      - name: Generate metadata file
+        run: |
+          cd output
+          shopt -s nullglob
+          IPKS=( *.ipk )
+          
+          {
+            echo "Metadata-Version: 2.1"
+            echo "Name: ${{ env.ARCHIVE_NAME }}"
+            echo "Version: $BRANCH"
+            echo "Author: $GITHUB_ACTOR"
+            echo "Home-page: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+            echo "Platform: ${{ matrix.arch }}"
+            echo ""
+            echo "Packages for ImmortalWrt $BRANCH running on ${{ matrix.arch }}"
+            echo "Built from $PRNUMBER at commit $HEAD_ID"
+            echo ""
+            echo "Modified packages:"
+            for p in $PACKAGES; do echo "  - $p"; done
+            echo ""
+            echo "Package count: ${#IPKS[@]}"
+            echo "Size summary:"
+            for f in "${IPKS[@]}"; do du -sh "$f"; done
+          } > PKG-INFO
+          cat PKG-INFO
+
+      - name: Store packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}-packages
+          path: |
+            output/*.ipk
+            output/PKG-INFO
+
+      - name: Store logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}-logs
+          path: |
+            logs/
+            output/PKG-INFO
